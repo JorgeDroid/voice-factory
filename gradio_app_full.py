@@ -400,7 +400,23 @@ def main():
     
     print(f"Using device: {device}")
     
-    attn_impl = None if args.no_flash_attn else "flash_attention_2"
+    # Logic to determine attention implementation
+    try:
+        import flash_attn
+        has_flash_attn = True
+    except ImportError:
+        has_flash_attn = False
+
+    if args.no_flash_attn:
+        attn_impl = None
+    elif device == "mps":
+        print("MPS detected. Disabling Flash Attention 2.")
+        attn_impl = None
+    elif not has_flash_attn:
+        print("Flash Attention package not found. Falling back to default attention implementation.")
+        attn_impl = None
+    else:
+        attn_impl = "flash_attention_2"
 
     print("\nLoading Voice Design Model (Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)...")
     tts_design = Qwen3TTSModel.from_pretrained(

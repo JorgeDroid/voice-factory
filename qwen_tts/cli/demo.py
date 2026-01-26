@@ -597,6 +597,21 @@ def main(argv=None) -> int:
     ckpt = _resolve_checkpoint(args)
 
     dtype = _dtype_from_str(args.dtype)
+    
+    # Check if flash_attn is actually available
+    try:
+        import flash_attn
+    except ImportError:
+        if args.flash_attn:
+            print("Warning: flash-attn not found, disabling Flash Attention 2.")
+        args.flash_attn = False
+    
+    # Disable on MPS
+    if args.device == "mps" or "mps" in str(args.device):
+        if args.flash_attn:
+            print("Warning: MPS detected, disabling Flash Attention 2.")
+        args.flash_attn = False
+
     attn_impl = "flash_attention_2" if args.flash_attn else None
 
     tts = Qwen3TTSModel.from_pretrained(
