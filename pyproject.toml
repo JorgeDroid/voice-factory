@@ -29,6 +29,10 @@ dependencies = [
   "sox",
   "onnxruntime",
   "einops",
+  "demucs",
+  "openai-whisper",
+  "pydantic==2.9.2",
+  "fastapi==0.112.2",
 ]
 
 [project.urls]

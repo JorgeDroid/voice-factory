@@ -14,6 +14,8 @@ import librosa
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
+from voice_isolation import isolate_voice
+from audio_utils import extract_audio_from_video, transcribe_audio, clip_audio
 
 # --- Utils copied/adapted from demo.py ---
 
@@ -196,13 +198,19 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                             value="Auto",
                             interactive=True
                         )
+                        vc_instruct = gr.Textbox(
+                            label="Style Instruction (Optional)", 
+                            lines=2, 
+                            placeholder="e.g. Speak slowly, Say it sadly",
+                            info="Control the pace and emotion natively."
+                        )
                         vc_btn = gr.Button("Generate Custom Voice", variant="primary")
 
                     with gr.Column(scale=3):
                         vc_out = gr.Audio(label="Output Audio", type="numpy")
                         vc_status = gr.Textbox(label="Status", lines=2)
 
-                def run_custom_voice(ref_aud, ref_txt, xvec_mode, text, lang_disp):
+                def run_custom_voice(ref_aud, ref_txt, xvec_mode, text, lang_disp, instruct):
                     if not text.strip(): return None, "Target text is required."
                     at = _audio_to_tuple(ref_aud)
                     if not at: return None, "Reference audio is required."
@@ -211,19 +219,30 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                     
                     try:
                         lang = lang_map.get(lang_disp, "Auto")
+                        
+                        # Handle Instruction manually for Base model
+                        kwargs = dict(gen_kwargs)
+                        if instruct and instruct.strip():
+                            # Tokenize instruction exactly like the model does internally for other modes
+                            instruct_text = f"<|im_start|>user\n{instruct.strip()}<|im_end|>\n"
+                            # tts_clone._tokenize_texts returns list of tensors
+                            instruct_ids = tts_clone._tokenize_texts([instruct_text])[0]
+                            # Pass as list of tensors (batch size 1)
+                            kwargs["instruct_ids"] = [instruct_ids]
+
                         wavs, sr = tts_clone.generate_voice_clone(
                             text=text.strip(),
                             language=lang,
                             ref_audio=at,
                             ref_text=ref_txt.strip() if ref_txt else None,
                             x_vector_only_mode=xvec_mode,
-                            **gen_kwargs
+                            **kwargs
                         )
                         return _wav_to_gradio_audio(wavs[0], sr), "Finished."
                     except Exception as e:
                         return None, str(e)
 
-                vc_btn.click(run_custom_voice, inputs=[vc_ref_audio, vc_ref_text, vc_xvec, vc_text, vc_lang], outputs=[vc_out, vc_status])
+                vc_btn.click(run_custom_voice, inputs=[vc_ref_audio, vc_ref_text, vc_xvec, vc_text, vc_lang, vc_instruct], outputs=[vc_out, vc_status])
 
             # --- TAB 3: SAVE / LOAD VOICE ---
             with gr.Tab("Save / Load Voice"):
@@ -243,6 +262,11 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                             placeholder="Transcription (required unless using x-vector only)."
                         )
                         sl_name_in = gr.Textbox(label="Voice Name", placeholder="e.g. MyNarrator")
+                        sl_def_instruct = gr.Textbox(
+                            label="Default Style Instruction",
+                            placeholder="e.g. Speak slowly and calmly",
+                            info="Saved with the voice and auto-loaded."
+                        )
                         sl_xvec = gr.Checkbox(label="Use x-vector only", value=False)
                         sl_save_btn = gr.Button("Save Voice to Library", variant="primary")
                         sl_save_status = gr.Textbox(label="Save Status", lines=1)
@@ -270,7 +294,7 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                         sl_out = gr.Audio(label="Output Audio", type="numpy")
                         sl_gen_status = gr.Textbox(label="Generate Status", lines=2)
 
-                def save_named_voice(ref_aud, ref_txt, name, xvec_mode):
+                def save_named_voice(ref_aud, ref_txt, name, def_inst, xvec_mode):
                     if not name or not name.strip(): return None, "Voice name is required."
                     at = _audio_to_tuple(ref_aud)
                     if not at: return None, "Reference audio is required."
@@ -291,7 +315,10 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                         out_path = os.path.join("saved_voices", f"{filename}.pt")
                         
                         # Serialize
-                        payload = {"items": [asdict(it) for it in items]}
+                        payload = {
+                            "items": [asdict(it) for it in items],
+                            "default_instruction": def_inst.strip() if def_inst else ""
+                        }
                         torch.save(payload, out_path)
                         
                         # Return updated dropdown
@@ -331,11 +358,16 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                                 ref_text=d.get("ref_text")
                             ))
                         
+                        # Use provided instruction, OR fallback to saved default if available and provided is empty
+                        final_instruct = instruct
+                        if not final_instruct or not final_instruct.strip():
+                            final_instruct = payload.get("default_instruction", "")
+
                         # Handle Instruction manually for Base model
                         kwargs = dict(gen_kwargs)
-                        if instruct and instruct.strip():
+                        if final_instruct and final_instruct.strip():
                             # Tokenize instruction exactly like the model does internally for other modes
-                            instruct_text = f"<|im_start|>user\n{instruct.strip()}<|im_end|>\n"
+                            instruct_text = f"<|im_start|>user\n{final_instruct.strip()}<|im_end|>\n"
                             instruct_ids = tts_clone._tokenize_texts([instruct_text])[0]
                             # Pass as list of tensors (batch size 1)
                             kwargs["instruct_ids"] = [instruct_ids]
@@ -365,16 +397,35 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                     except Exception as e:
                         return None, str(e)
 
+                def on_voice_select(voice_filename):
+                    if not voice_filename: return gr.update(value="")
+                    try:
+                        path = os.path.join("saved_voices", voice_filename)
+                        if not os.path.exists(path): return gr.update(value="")
+                        payload = torch.load(path, map_location="cpu")
+                        if isinstance(payload, dict):
+                            return gr.update(value=payload.get("default_instruction", ""))
+                    except:
+                        pass
+                    return gr.update(value="")
+
                 def refresh_list():
                     new_list = get_saved_voices()
                     return gr.update(choices=new_list)
 
                 sl_save_btn.click(
                     save_named_voice, 
-                    inputs=[sl_ref_audio, sl_ref_text, sl_name_in, sl_xvec], 
+                    inputs=[sl_ref_audio, sl_ref_text, sl_name_in, sl_def_instruct, sl_xvec], 
                     outputs=[sl_save_status, sl_voice_dropdown]
                 )
                 
+                # Auto-fill instruction when voice is selected
+                sl_voice_dropdown.change(
+                    on_voice_select,
+                    inputs=[sl_voice_dropdown],
+                    outputs=[sl_instruct]
+                )
+
                 sl_refresh_btn.click(refresh_list, outputs=[sl_voice_dropdown])
                 
                 sl_gen_btn.click(
@@ -382,6 +433,123 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                     inputs=[sl_voice_dropdown, sl_text, sl_instruct, sl_lang, sl_speed], 
                     outputs=[sl_out, sl_gen_status]
                 )
+
+            # --- TAB 4: VOICE ISOLATION ---
+            with gr.Tab("Voice Isolation"):
+                gr.Markdown("### Remove background noise/music from audio")
+                with gr.Row():
+                    with gr.Column(scale=2):
+                        vi_input = gr.Audio(label="Input Audio", type="filepath")
+                        vi_btn = gr.Button("Isolate Voice", variant="primary")
+                    
+                    with gr.Column(scale=3):
+                        vi_output = gr.Audio(label="Isolated Vocals", type="filepath")
+                        vi_status = gr.Textbox(label="Status", lines=2)
+                
+                def run_isolation(audio_path):
+                    if not audio_path:
+                        return None, "Please upload an audio file."
+                    try:
+                        # isolate_voice returns path to vocals
+                        vocals_path = isolate_voice(audio_path)
+                        return vocals_path, "Isolation complete."
+                    except Exception as e:
+                        return None, str(e)
+
+                vi_btn.click(run_isolation, inputs=[vi_input], outputs=[vi_output, vi_status])
+
+            # --- TAB 5: UTILITIES ---
+            with gr.Tab("Utilities"):
+                gr.Markdown("### Helper Tools")
+                
+                with gr.Tabs():
+                    # 5a. Extract Audio
+                    with gr.Tab("Extract Audio from Video"):
+                        gr.Markdown("#### Convert MP4 to WAV")
+                        with gr.Row():
+                            ext_vid = gr.Video(label="Input Video")
+                            ext_btn = gr.Button("Extract Audio", variant="primary")
+                        ext_out = gr.Audio(label="Extracted Audio", type="filepath")
+                        ext_file = gr.File(label="Download WAV")
+                        ext_status = gr.Textbox(label="Status", lines=1)
+                        
+                        def run_extract(vid_path):
+                            if not vid_path: return None, None, "No video uploaded."
+                            try:
+                                out = extract_audio_from_video(vid_path)
+                                return out, out, "Extraction complete."
+                            except Exception as e:
+                                return None, None, str(e)
+                                
+                        ext_btn.click(run_extract, inputs=[ext_vid], outputs=[ext_out, ext_file, ext_status])
+
+                    # 5b. Transcribe
+                    with gr.Tab("Transcribe Audio"):
+                        gr.Markdown("#### Speech-to-Text (Whisper)")
+                        with gr.Row():
+                            tr_aud = gr.Audio(label="Input Audio", type="filepath")
+                            with gr.Column():
+                                tr_model = gr.Dropdown(
+                                    label="Model Size", 
+                                    choices=["tiny", "base", "small", "medium", "large"], 
+                                    value="base"
+                                )
+                                tr_lang = gr.Textbox(label="Language Code (Optional)", placeholder="e.g. en, es (Leave empty for auto)")
+                                tr_btn = gr.Button("Transcribe", variant="primary")
+                        
+                        tr_out = gr.Textbox(label="Transcription", lines=6, show_copy_button=True)
+                        tr_status = gr.Textbox(label="Status", lines=1)
+                        
+                        def run_transcribe(aud_path, model_sz, lang_code):
+                            if not aud_path: return None, "No audio uploaded."
+                            try:
+                                lang = lang_code.strip() if lang_code.strip() else None
+                                txt = transcribe_audio(aud_path, model_size=model_sz, language=lang)
+                                return txt, "Transcription complete."
+                            except Exception as e:
+                                return None, str(e)
+                                
+                        tr_btn.click(run_transcribe, inputs=[tr_aud, tr_model, tr_lang], outputs=[tr_out, tr_status])
+
+                    # 5c. Clip Audio
+                    with gr.Tab("Clip Audio"):
+                        gr.Markdown("#### Slice Audio Segment (Slider precise control)")
+                        
+                        with gr.Row():
+                            cl_aud = gr.Audio(label="Input Audio", type="filepath")
+                            with gr.Column():
+                                # Initial max is arbitrary, will be updated on upload
+                                cl_start = gr.Slider(label="Start Time (s)", minimum=0, maximum=300, value=0, step=0.1)
+                                cl_end = gr.Slider(label="End Time (s)", minimum=0, maximum=300, value=10, step=0.1)
+                                cl_btn = gr.Button("Clip Audio", variant="primary")
+                        
+                        cl_out = gr.Audio(label="Clipped Audio", type="filepath")
+                        cl_file = gr.File(label="Download Clip")
+                        cl_status = gr.Textbox(label="Status", lines=1)
+                        
+                        def update_slider_range(audio_path):
+                            if not audio_path:
+                                return gr.update(), gr.update()
+                            try:
+                                dur = librosa.get_duration(path=audio_path)
+                                # Set max to duration, default end to duration
+                                return gr.update(maximum=dur, value=0), gr.update(maximum=dur, value=dur)
+                            except Exception as e:
+                                print(f"Error getting duration: {e}")
+                                return gr.update(), gr.update()
+
+                        # Update sliders when audio is uploaded/changed
+                        cl_aud.change(update_slider_range, inputs=[cl_aud], outputs=[cl_start, cl_end])
+                        
+                        def run_clip(aud_path, start, end):
+                            if not aud_path: return None, None, "No audio uploaded."
+                            try:
+                                out = clip_audio(aud_path, float(start), float(end))
+                                return out, out, "Clipping complete."
+                            except Exception as e:
+                                return None, None, str(e)
+                                
+                        cl_btn.click(run_clip, inputs=[cl_aud, cl_start, cl_end], outputs=[cl_out, cl_file, cl_status])
 
     return demo
 
@@ -400,23 +568,11 @@ def main():
     
     print(f"Using device: {device}")
     
-    # Logic to determine attention implementation
-    try:
-        import flash_attn
-        has_flash_attn = True
-    except ImportError:
-        has_flash_attn = False
-
-    if args.no_flash_attn:
-        attn_impl = None
-    elif device == "mps":
-        print("MPS detected. Disabling Flash Attention 2.")
-        attn_impl = None
-    elif not has_flash_attn:
-        print("Flash Attention package not found. Falling back to default attention implementation.")
-        attn_impl = None
-    else:
+    # Only use flash_attention_2 if explicitly safe (CUDA) and not disabled
+    if not args.no_flash_attn and device.startswith("cuda"):
         attn_impl = "flash_attention_2"
+    else:
+        attn_impl = None
 
     print("\nLoading Voice Design Model (Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)...")
     tts_design = Qwen3TTSModel.from_pretrained(
