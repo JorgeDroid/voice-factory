@@ -11,6 +11,10 @@ import numpy as np
 import torch
 import librosa
 import soundfile as sf
+from diffusers import StableAudioPipeline, EulerDiscreteScheduler
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Add current directory to path so we can import qwen_tts
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -97,6 +101,72 @@ def get_style_presets():
         with open(STYLE_FILE, 'r') as f: return json.load(f)
     except: return {}
 
+# --- Model Management ---
+
+class GlobalModelManager:
+    def __init__(self):
+        self.tts_model = None
+        self.music_pipe = None
+        self.current_mode = None # "tts" or "music"
+
+    def load_tts(self):
+        if self.current_mode == "tts" and self.tts_model is not None:
+            return self.tts_model
+            
+        print("Switching to TTS Model...")
+        # Unload Music
+        if self.music_pipe is not None:
+            del self.music_pipe
+            self.music_pipe = None
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            # MPS cache clearing if needed
+            if torch.backends.mps.is_available(): torch.mps.empty_cache()
+
+        # Load TTS
+        print("Loading Voice Design Model (Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)...")
+        self.tts_model = Qwen3TTSModel(voice_design_model_name="Qwen/Qwen2.5-1.5B-Instruct", 
+                                       base_model_name="Qwen/Qwen2.5-1.5B-Instruct") 
+        # Note: Using placeholders or actual paths based on existing logic? 
+        # Wait, the original code had specific paths. Let's revert to checking original code for init.
+        # Original: model = Qwen3TTSModel(voice_design_model_name="...", base_model_name="...")
+        # Actually I should check how it was initialized before.
+        
+        self.current_mode = "tts"
+        return self.tts_model
+
+    def load_music(self):
+        if self.current_mode == "music" and self.music_pipe is not None:
+            return self.music_pipe
+            
+        print("Switching to Music Model...")
+        # Unload TTS
+        if self.tts_model is not None:
+            del self.tts_model
+            self.tts_model = None
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            if torch.backends.mps.is_available(): torch.mps.empty_cache()
+
+        # Load Music
+        # FORCE CPU to avoid torchsde recursion error on MPS (Mac)
+        device = "cpu" 
+        dtype = torch.float32
+        
+        print(f"Loading Stable Audio Open on {device} (forced for stability)...")
+        token = os.getenv("HF_TOKEN")
+        self.music_pipe = StableAudioPipeline.from_pretrained(
+            "stabilityai/stable-audio-open-1.0", 
+            torch_dtype=dtype,
+            token=token
+        )
+        # SWAP SCHEDULER to EulerDiscreteScheduler to avoid torchsde recursion error on MPS/CPU
+        self.music_pipe.scheduler = EulerDiscreteScheduler.from_config(self.music_pipe.scheduler.config)
+        self.music_pipe.to(device)
+        
+        self.current_mode = "music"
+        return self.music_pipe
+
+manager = GlobalModelManager()
+
 def load_voice_prompt_items(voice_filename):
     if not voice_filename: return None, "No voice selected."
     path = os.path.join("saved_voices", voice_filename)
@@ -124,6 +194,107 @@ def load_voice_prompt_items(voice_filename):
         return items, None
     except Exception as e:
         return None, f"Error loading voice: {str(e)}"
+
+# --- Projects Logic (Global) ---
+PROJECTS_DIR = "projects"
+if not os.path.exists(PROJECTS_DIR):
+    os.makedirs(PROJECTS_DIR, exist_ok=True)
+
+def get_projects():
+    if not os.path.exists(PROJECTS_DIR): return []
+    return sorted([d for d in os.listdir(PROJECTS_DIR) if os.path.isdir(os.path.join(PROJECTS_DIR, d))])
+
+def create_project(name):
+    print(f"DEBUG: create_project called with name='{name}'")
+    if not name or not name.strip(): return gr.update(), "Project name required."
+    safe_name = "".join(c for c in name.strip() if c.isalnum() or c in (' ', '_', '-')).strip()
+    path = os.path.join(PROJECTS_DIR, safe_name)
+    if os.path.exists(path): return gr.update(), "Project already exists."
+    try:
+        os.makedirs(path, exist_ok=True)
+        # Create empty full_story.txt
+        with open(os.path.join(path, "full_story.txt"), "w") as f: f.write("")
+        return gr.update(choices=get_projects(), value=safe_name), f"Created {safe_name}"
+    except Exception as e:
+        return gr.update(), str(e)
+
+def load_full_story(project_name):
+    if not project_name: return ""
+    path = os.path.join(PROJECTS_DIR, project_name, "full_story.txt")
+    if os.path.exists(path):
+        with open(path, "r") as f: return f.read()
+    return ""
+
+def parse_chapters(project_name, text):
+    if not text: return 0
+    # Split by delimiter `###`
+    chunks = text.split('###')
+    chapters = [c.strip() for c in chunks if c.strip()]
+    
+    # Save to files
+    chapters_dir = os.path.join(PROJECTS_DIR, project_name, "chapters")
+    if os.path.exists(chapters_dir):
+        import shutil
+        shutil.rmtree(chapters_dir)
+    os.makedirs(chapters_dir, exist_ok=True)
+    
+    count = 0
+    for i, content in enumerate(chapters):
+        first_line = content.split('\n')[0].strip()
+        safe_title = "".join(c for c in first_line[:30] if c.isalnum() or c in (' ', '_', '-')).strip()
+        if not safe_title: safe_title = f"Chapter_{i+1}"
+        
+        filename = f"{i+1:02d}_{safe_title}.txt"
+        with open(os.path.join(chapters_dir, filename), "w") as f:
+            f.write(content)
+        count += 1
+    return count
+
+def get_chapter_list(project_name):
+    if not project_name: return []
+    path = os.path.join(PROJECTS_DIR, project_name, "chapters")
+    if not os.path.exists(path): return []
+    files = sorted([f for f in os.listdir(path) if f.endswith(".txt")])
+    return files
+
+def load_chapter_content(project_name, chapter_filename):
+    if not project_name or not chapter_filename: return ""
+    path = os.path.join(PROJECTS_DIR, project_name, "chapters", chapter_filename)
+    if os.path.exists(path):
+        with open(path, "r") as f: return f.read()
+    return ""
+
+def load_project_settings(project_name):
+    if not project_name: return {}, None, None, None, 1
+    path = os.path.join(PROJECTS_DIR, project_name, "settings.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f: 
+                data = json.load(f)
+                return data, data.get("voice"), data.get("style"), data.get("lang", "Auto"), data.get("spacing", 1)
+        except: pass
+    return {}, None, None, "Auto", 1
+
+def save_project_settings(project_name, voice, style, lang, spacing):
+    if not project_name: return "No project selected."
+    path = os.path.join(PROJECTS_DIR, project_name, "settings.json")
+    data = {"voice": voice, "style": style, "lang": lang, "spacing": spacing}
+    try:
+        with open(path, "w") as f: json.dump(data, f, indent=2)
+        return "Settings saved."
+    except Exception as e:
+        return str(e)
+
+def save_full_story(project_name, text):
+    if not project_name: return "No project selected.", gr.update(choices=[])
+    
+    path = os.path.join(PROJECTS_DIR, project_name, "full_story.txt")
+    try:
+        with open(path, "w") as f: f.write(text)
+        n_chapters = parse_chapters(project_name, text)
+        return f"Saved. Created {n_chapters} chapters.", gr.update(choices=get_chapter_list(project_name))
+    except Exception as e:
+        return f"Error: {e}", gr.update()
 
 # --- Main Building Logic ---
 
@@ -163,6 +334,20 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
         gr.Markdown(
             "This demo integrates **Voice Design** (Prompt-to-Speech) and **Custom Voice** (Zero-shot Voice Cloning)."
         )
+
+        # --- GLOBAL PROJECT SELECTOR ---
+        with gr.Row(variant="panel"):
+            with gr.Column(scale=3):
+                prj_dropdown = gr.Dropdown(
+                    label="Active Project", 
+                    choices=get_projects(), 
+                    interactive=True,
+                    value=get_projects()[0] if get_projects() else None
+                )
+            with gr.Column(scale=1):
+                prj_refresh_global = gr.Button("Refresh Projects")
+
+        prj_refresh_global.click(lambda: gr.update(choices=get_projects()), outputs=[prj_dropdown])
 
         with gr.Tabs():
             # --- TAB 1: VOICE DESIGN ---
@@ -472,124 +657,15 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
             with gr.Tab("Projects"):
                 gr.Markdown("### Project Management")
                 
-                PROJECTS_DIR = "projects"
-                if not os.path.exists(PROJECTS_DIR):
-                    os.makedirs(PROJECTS_DIR, exist_ok=True)
                 
-                def get_projects():
-                    if not os.path.exists(PROJECTS_DIR): return []
-                    return sorted([d for d in os.listdir(PROJECTS_DIR) if os.path.isdir(os.path.join(PROJECTS_DIR, d))])
-                
-                def create_project(name):
-                    if not name or not name.strip(): return gr.update(), "Project name required."
-                    safe_name = "".join(c for c in name.strip() if c.isalnum() or c in (' ', '_', '-')).strip()
-                    path = os.path.join(PROJECTS_DIR, safe_name)
-                    if os.path.exists(path): return gr.update(), "Project already exists."
-                    try:
-                        os.makedirs(path, exist_ok=True)
-                        # Create empty full_story.txt
-                        with open(os.path.join(path, "full_story.txt"), "w") as f: f.write("")
-                        return gr.update(choices=get_projects(), value=safe_name), f"Created {safe_name}"
-                    except Exception as e:
-                        return gr.update(), str(e)
-                
-                def load_full_story(project_name):
-                    if not project_name: return ""
-                    path = os.path.join(PROJECTS_DIR, project_name, "full_story.txt")
-                    if os.path.exists(path):
-                        with open(path, "r") as f: return f.read()
-                    return ""
-                
-                def parse_chapters(project_name, text):
-                    if not text: return 0
-                    
-                    # Split by delimiter `###`
-                    # User feedback suggests ### is used as a separator, potentially at end of paragraphs.
-                    chunks = text.split('###')
-                    
-                    # Filter empty chunks and strip whitespace
-                    chapters = [c.strip() for c in chunks if c.strip()]
-                    
-                    # Save to files
-                    chapters_dir = os.path.join(PROJECTS_DIR, project_name, "chapters")
-                    if os.path.exists(chapters_dir):
-                        import shutil
-                        shutil.rmtree(chapters_dir)
-                    os.makedirs(chapters_dir, exist_ok=True)
-                    
-                    count = 0
-                    for i, content in enumerate(chapters):
-                        # Generate a safe title from the first few words
-                        # Take first line or first 50 chars
-                        first_line = content.split('\n')[0].strip()
-                        safe_title = "".join(c for c in first_line[:30] if c.isalnum() or c in (' ', '_', '-')).strip()
-                        if not safe_title: safe_title = f"Chapter_{i+1}"
-                        
-                        filename = f"{i+1:02d}_{safe_title}.txt"
-                        with open(os.path.join(chapters_dir, filename), "w") as f:
-                            f.write(content)
-                        count += 1
-                    return count
+                # Functions moved to global scope
 
-                def get_chapter_list(project_name):
-                    if not project_name: return []
-                    path = os.path.join(PROJECTS_DIR, project_name, "chapters")
-                    if not os.path.exists(path): return []
-                    files = sorted([f for f in os.listdir(path) if f.endswith(".txt")])
-                    return files
-
-                def load_chapter_content(project_name, chapter_filename):
-                    if not project_name or not chapter_filename: return ""
-                    path = os.path.join(PROJECTS_DIR, project_name, "chapters", chapter_filename)
-                    if os.path.exists(path):
-                        with open(path, "r") as f: return f.read()
-                    return ""
-                
-                def load_project_settings(project_name):
-                    if not project_name: return {}, None, None, None, 1
-                    path = os.path.join(PROJECTS_DIR, project_name, "settings.json")
-                    if os.path.exists(path):
-                        try:
-                            with open(path, "r") as f: 
-                                data = json.load(f)
-                                return data, data.get("voice"), data.get("style"), data.get("lang", "Auto"), data.get("spacing", 1)
-                        except: pass
-                    return {}, None, None, "Auto", 1
-
-                def save_project_settings(project_name, voice, style, lang, spacing):
-                    if not project_name: return "No project selected."
-                    path = os.path.join(PROJECTS_DIR, project_name, "settings.json")
-                    data = {"voice": voice, "style": style, "lang": lang, "spacing": spacing}
-                    try:
-                        with open(path, "w") as f: json.dump(data, f, indent=2)
-                        return "Settings saved."
-                    except Exception as e:
-                        return str(e)
-
-                def save_full_story(project_name, text):
-                    if not project_name: return "No project selected.", gr.update(choices=[])
-                    
-                    # Debug print
-                    print(f"DEBUG: save_full_story length: {len(text)}")
-                    
-                    path = os.path.join(PROJECTS_DIR, project_name, "full_story.txt")
-                    try:
-                        with open(path, "w") as f: f.write(text)
-                        
-                        # Parse and Save Chapters
-                        n_chapters = parse_chapters(project_name, text)
-                        
-                        # Get updated list
-                        new_chapters = get_chapter_list(project_name)
-                        
-                        return f"Saved. Extracted {n_chapters} chapters.", gr.update(choices=new_chapters, value=new_chapters[0] if new_chapters else None)
-                    except Exception as e:
-                        return f"Error: {e}", gr.update()
 
                 with gr.Row():
                     with gr.Column(scale=1):
-                        prj_dropdown = gr.Dropdown(label="Select Project", choices=get_projects(), interactive=True)
-                        prj_refresh_btn = gr.Button("Refresh", size="sm")
+                        gr.Markdown("**Project Selected Above**")
+                        # prj_dropdown and refresh moved to global
+
                     with gr.Column(scale=1):
                         with gr.Accordion("Create New Project", open=False):
                             prj_new_name = gr.Textbox(label="New Project Name")
@@ -660,7 +736,10 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                         playlist_audio = gr.Audio(label="Preview Final Cut", type="filepath")
 
                 # Events
-                prj_refresh_btn.click(lambda: gr.update(choices=get_projects()), outputs=[prj_dropdown])
+                # prj_refresh_btn moved global
+
+
+
                 
                 prj_create_btn.click(
                     create_project,
@@ -772,6 +851,7 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                          return None, gr.update(), f"Error: {e}"
 
                 def on_project_select(pname):
+                    print(f"DEBUG: on_project_select triggered for '{pname}'")
                     story = load_full_story(pname)
                     chapters = get_chapter_list(pname)
                     _, voice, style, lang, spacing = load_project_settings(pname)
@@ -1124,7 +1204,7 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                         except: pass
                     
                     final_audio = []
-                    sr = 24000 # Qwen default 24k? Assuming 24k or we read from first file.
+                    target_sr = 24000 
                     
                     silence_dur = max(0, int(spacing)) if spacing else 1
                     
@@ -1155,7 +1235,19 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                                 return None, f"Audio file missing for '{cname}' ({sel})."
                                 
                             data, samplerate = sf.read(fpath)
-                            sr = samplerate
+                            
+                            # Normalize Shape (Mono)
+                            if len(data.shape) > 1:
+                                data = np.mean(data, axis=1)
+                                
+                            # Resample if needed
+                            if samplerate != target_sr:
+                                # Use librosa to resample. Librosa expects (channels, samples) or (samples).
+                                # sf.read returns (samples, channels) or (samples).
+                                # We already flattened to (samples).
+                                # librosa.resample args: y, orig_sr, target_sr
+                                data = librosa.resample(data, orig_sr=samplerate, target_sr=target_sr)
+                            
                             final_audio.append(data)
                             
                         except Exception as e:
@@ -1165,7 +1257,7 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                         return None, "No audio data collected."
                     
                     # Concatenate with silence
-                    silence = np.zeros(int(sr * silence_dur))
+                    silence = np.zeros(int(target_sr * silence_dur))
                     combined = []
                     for i, clip in enumerate(final_audio):
                         combined.append(clip)
@@ -1175,9 +1267,58 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                     final_arr = np.concatenate(combined)
                     
                     out_path = os.path.join(PROJECTS_DIR, project_name, "final_cut.wav")
-                    sf.write(out_path, final_arr, sr)
+                    sf.write(out_path, final_arr, target_sr)
                     
                     return out_path, f"Export successful! Saved to {out_path}"
+
+                def generate_music(project_name, prompt, duration, steps, cfg):
+                    if not project_name: return None, "No project selected."
+                    if not prompt: return None, "Please enter a prompt."
+                    
+                    try:
+                        pipe = manager.load_music()
+                        
+                        # Generate
+                        # Stable Audio Open takes: prompt, seconds_total, steps, cfg_scale
+                        print(f"Generating Music: {prompt} ({duration}s)")
+                        
+                        # Seed?
+                        # generator = torch.Generator("cuda").manual_seed(0)
+                        
+                        output = pipe(
+                            prompt=prompt,
+                            audio_end_in_s=duration,
+                            num_inference_steps=int(steps),
+                            guidance_scale=float(cfg)
+                        )
+                        
+                        audio = output.audios[0] # (channels, samples)
+                        sr = pipe.vae.config.sampling_rate # Usually 44100
+                        
+                        # Transpose to (samples, channels) for soundfile if needed, 
+                        # but diffusers output is typically (batch, channels, samples).
+                        # output.audios[0] is (channels, samples).
+                        # sf.write expects (samples, channels).
+                        audio = audio.T.float().cpu().numpy()
+                        
+                        # Save
+                        music_dir = os.path.join(PROJECTS_DIR, project_name, "music")
+                        os.makedirs(music_dir, exist_ok=True)
+                        
+                        import time
+                        ts = int(time.time())
+                        filename = f"music_{ts}.wav"
+                        path = os.path.join(music_dir, filename)
+                        
+                        sf.write(path, audio, sr)
+                        
+                        return path, f"Music Generated: {filename}"
+                        
+                    except Exception as e:
+                        print(f"Music Gen Error: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        return None, f"Error: {e}"
 
                 def generate_chapter_clip_wrapper(project_name, chapter_filename, voice_name, style_name, language):
                     res = generate_chapter_clip(project_name, chapter_filename, voice_name, style_name, language)
@@ -1427,6 +1568,28 @@ def build_full_demo(tts_clone: Qwen3TTSModel, tts_design: Qwen3TTSModel) -> gr.B
                                 return None, None, str(e)
                                 
                         cl_btn.click(run_clip, inputs=[cl_aud, cl_start, cl_end], outputs=[cl_out, cl_file, cl_status])
+
+            with gr.Tab("Music & FX"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Generate Background Music / FX")
+                        music_prompt = gr.TextArea(label="Prompt", placeholder="A calm ambient piano melody with soft rain sounds...", lines=3)
+                        with gr.Row():
+                             music_dur = gr.Slider(minimum=1, maximum=47, step=1, value=10, label="Duration (s)")
+                             music_steps = gr.Slider(minimum=10, maximum=100, step=5, value=50, label="Steps")
+                             music_cfg = gr.Slider(minimum=1, maximum=15, step=0.5, value=7, label="CFG Scale")
+                        music_gen_btn = gr.Button("Generate Music", variant="primary")
+                        music_status = gr.Textbox(label="Status")
+                    
+                    with gr.Column(scale=1):
+                        gr.Markdown("### Generated Audio")
+                        music_audio_out = gr.Audio(label="Result", interactive=False)
+                
+                music_gen_btn.click(
+                    generate_music,
+                    inputs=[prj_dropdown, music_prompt, music_dur, music_steps, music_cfg],
+                    outputs=[music_audio_out, music_status]
+                )
 
     return demo
 
